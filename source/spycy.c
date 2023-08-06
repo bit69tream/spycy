@@ -21,8 +21,12 @@
 #include <unistd.h>
 #include <stdnoreturn.h>
 #include <stdbool.h>
+#include <assert.h>
 
 #include <sqlite3.h>
+
+#define STB_DS_IMPLEMENTATION
+#include "stb_ds.h"
 
 volatile sig_atomic_t quit = 0;
 
@@ -32,9 +36,75 @@ volatile sig_atomic_t quit = 0;
     goto exit;                                  \
   } while (0)
 
+typedef struct {
+  uint64_t start_time_ns;
+  char executable_path[PATH_MAX];
+} process_info_t;
+
+typedef struct {
+  pid_t key;
+  process_info_t value;
+} item_t;
+
+item_t*  pids = NULL;
+
+int pid_to_executable_path(pid_t pid, char executable_path[PATH_MAX]) {
+  static char symlink_path[PATH_MAX];
+  snprintf(symlink_path, PATH_MAX, "/proc/%d/exe", pid);
+
+  int executable_path_len = readlink(symlink_path, executable_path, PATH_MAX);
+  if (executable_path_len != -1) {
+    executable_path[executable_path_len] = 0;
+  }
+  return executable_path_len;
+}
+
+void handle_exec_event(struct proc_event *event) {
+  (void) event;
+  assert(event->what == PROC_EVENT_EXEC);
+
+  pid_t pid = event->event_data.exec.process_pid;
+
+  pid_t index = -1;
+  if ((index = hmgeti(pids, pid)) >= 0) {
+    hmdel(pids, pid);
+  }
+
+  static process_info_t new_process_info = {};
+  new_process_info.start_time_ns = event->timestamp_ns;
+  if (pid_to_executable_path(pid, new_process_info.executable_path) == -1) {
+    fprintf(stderr, "ERROR: failed to readlink on /proc/%d/exe: %s\n", pid, strerror(errno));
+    return;
+  }
+
+  hmput(pids, pid, new_process_info);
+}
+
+void handle_exit_event(struct proc_event *event) {
+  (void) event;
+  assert(event->what == PROC_EVENT_EXIT);
+
+  pid_t pid = event->event_data.exec.process_pid;
+
+  item_t* item = hmgetp_null(pids, pid);
+  if (item == NULL) {
+    return;
+  }
+
+  uint64_t execution_time_ns = event->timestamp_ns - item->value.start_time_ns;
+  printf("%d %s %.3fs\n", pid, item->value.executable_path, execution_time_ns / 1e9);
+  assert(hmdel(pids, pid) == 1);
+}
+
 void handle_message(struct cn_msg *message) {
   (void) message;
-  printf("jaklsdfjlkasdfjkl\n");
+  struct proc_event *event = (struct proc_event *)message->data;
+
+  if (event->what == PROC_EVENT_EXEC) {
+    handle_exec_event(event);
+  } else if (event->what == PROC_EVENT_EXIT) {
+    handle_exit_event(event);
+  }
 }
 
 int main(int argc, char** argv) {
