@@ -33,7 +33,7 @@ volatile sig_atomic_t quit = 0;
 #define FAIL(reason)                            \
   do {                                          \
     perror("ERROR: " reason);                   \
-    goto exit;                                  \
+    destruct();                                 \
   } while (0)
 
 typedef struct {
@@ -47,6 +47,9 @@ typedef struct {
 } item_t;
 
 item_t*  pids = NULL;
+
+sqlite3* db = NULL;
+int connection = -1;
 
 int pid_to_executable_path(pid_t pid, char executable_path[PATH_MAX]) {
   static char symlink_path[PATH_MAX];
@@ -107,27 +110,80 @@ void handle_message(struct cn_msg *message) {
   }
 }
 
+char* default_db_path() {
+  /* TODO: put it somewhere like ~/.local/share/spycy/spycy.db or ${XDG_DATA_HOME}/spycy/spycy.db */
+  return "./spycy.db";
+}
+
+int code = 0;
+
+void destruct() {
+  if (connection != -1) {
+    close(connection);
+  }
+
+  assert(sqlite3_close(db) == SQLITE_OK);
+
+  exit(code);
+}
+
+void signal_handler(int asdf) {
+  (void) asdf;
+  destruct();
+}
+
+void prepare_db() {
+  assert(db != NULL);
+
+  char* error_message = NULL;
+  sqlite3_exec(db,
+               "CREATE TABLE IF NOT EXISTS spycy_data ("
+               " executable_path TEXT NOT NULL UNIQUE,"
+               " nanoseconds_spent INTEGER NOT NULL,"
+               " username TEXT NOT NULL,"
+               " PRIMARY KEY(executable_path)"
+               ");",
+               NULL, NULL, &error_message);
+
+  if (error_message != NULL) {
+    fprintf(stderr, "ERROR: failed to prepare database: %s\n", error_message);
+    sqlite3_free(error_message);
+
+    destruct();
+  }
+}
+
 int main(int argc, char** argv) {
-  (void) argc;
-  (void) argv;
+  char* db_path = NULL;
 
-  int code = 0;
+  if (argc > 2) {
+    fprintf(stderr, "USAGE: %s <path to database file>\n", argv[0]);
+  } else if (argc == 2) {
+    db_path = argv[1];
+  } else {
+    db_path = default_db_path();
+  }
 
-  int connection = -1;
+  if (sqlite3_open(db_path, &db)) {
+    fprintf(stderr, "ERROR: failed to open database: %s\n", sqlite3_errmsg(db));
+    code = 1;
+    destruct();
+  }
+
+  prepare_db();
+
   if ((connection = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR)) == -1) {
     FAIL("socket");
+  }
+
+  if (signal(SIGINT, signal_handler) == SIG_ERR || signal(SIGTERM, signal_handler) == SIG_ERR) {
+    FAIL("signal");
   }
 
   struct sockaddr_nl my = {
     .nl_family = AF_NETLINK,
     .nl_groups = CN_IDX_PROC,
     .nl_pid = getpid(),
-  };
-
-  struct sockaddr_nl kernel = {
-    .nl_family = AF_NETLINK,
-    .nl_groups = CN_IDX_PROC,
-    .nl_pid = 1,
   };
 
   if (bind(connection, (struct sockaddr *)&my, sizeof(my)) == -1) {
@@ -160,7 +216,8 @@ int main(int argc, char** argv) {
   }
 
   if (*message_operation == PROC_CN_MCAST_IGNORE) {
-    goto exit;
+    code = 2;
+    destruct();
   }
 
   while (!quit) {
@@ -170,7 +227,12 @@ int main(int argc, char** argv) {
 
     memset(buffer, 0, sizeof(buffer));
 
-    struct sockaddr_nl from = kernel;
+    struct sockaddr_nl from = {
+      .nl_family = AF_NETLINK,
+      .nl_groups = CN_IDX_PROC,
+      .nl_pid = 1,
+    };
+
     socklen_t from_len = sizeof (from);
     size_t received_len = recvfrom(connection, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_len);
     if (from.nl_pid != 0 || received_len < 1) {
@@ -205,8 +267,4 @@ int main(int argc, char** argv) {
       header = NLMSG_NEXT(header, received_len);
     }
   }
-
- exit:
-  if (connection != -1) close(connection);
-  return code;
 }
