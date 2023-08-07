@@ -55,7 +55,13 @@ typedef struct {
   process_info_t value;
 } item_t;
 
+typedef struct {
+  char* key;
+  uint64_t value;
+} counter_map_t;
+
 item_t* pids = NULL;
+counter_map_t* pid_counts = NULL;
 
 sqlite3* db = NULL;
 int connection = -1;
@@ -109,10 +115,19 @@ void handle_exec_event(struct proc_event *event) {
     fprintf(stderr, "WARNING: failed to readlink on /proc/%d/exe: %s\n", pid, strerror(errno));
     return;
   }
-
   new_process_info.uid = uid_by_pid(pid);
 
   hmput(pids, pid, new_process_info);
+
+  item_t* new_item = hmgetp_null(pids, pid);
+  assert(new_item != NULL);
+
+  counter_map_t* counter = shgetp_null(pid_counts, new_item->value.executable_path);
+  if (counter != NULL) {
+    counter->value++;
+  } else {
+    shput(pid_counts, new_item->value.executable_path, 1);
+  }
 }
 
 bool exists_in_db(char* executable_path, char* username) {
@@ -229,6 +244,7 @@ void destruct() {
   }
 
   hmfree(pids);
+  shfree(pid_counts);
 
   if (sqlite3_close(db) != SQLITE_OK) {
     should_close = true;
@@ -249,8 +265,15 @@ void handle_exit_event(struct proc_event *event) {
     return;
   }
 
-  uint64_t execution_time_ns = event->timestamp_ns - item->value.start_time_ns;
-  save_to_db(execution_time_ns, item->value.executable_path, item->value.uid);
+  counter_map_t* counter = shgetp_null(pid_counts, item->value.executable_path);
+  assert(counter != NULL);
+
+  counter->value--;
+  if (counter->value == 0) {
+    uint64_t execution_time_ns = event->timestamp_ns - item->value.start_time_ns;
+    save_to_db(execution_time_ns, item->value.executable_path, item->value.uid);
+  }
+
   assert(hmdel(pids, pid) == 1);
 }
 
