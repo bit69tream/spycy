@@ -33,12 +33,21 @@ volatile sig_atomic_t quit = 0;
 #define FAIL(reason)                            \
   do {                                          \
     perror("ERROR: " reason);                   \
+    code = 1;                                   \
+    destruct();                                 \
+  } while (0)
+
+#define SQLITE3_FAIL(...)                       \
+  do {                                          \
+    fprintf(stderr, __VA_ARGS__);               \
+    code = 1;                                   \
     destruct();                                 \
   } while (0)
 
 typedef struct {
   uint64_t start_time_ns;
   char executable_path[PATH_MAX];
+  uid_t uid;
 } process_info_t;
 
 typedef struct {
@@ -46,12 +55,29 @@ typedef struct {
   process_info_t value;
 } item_t;
 
-item_t*  pids = NULL;
+item_t* pids = NULL;
 
 sqlite3* db = NULL;
 int connection = -1;
 
-int pid_to_executable_path(pid_t pid, char executable_path[PATH_MAX]) {
+int code = 0;
+
+bool should_close = false;
+
+void destruct() {
+  if (sqlite3_close(db) != SQLITE_OK) {
+    should_close = true;
+    return;
+  }
+
+  if (connection != -1) {
+    close(connection);
+  }
+
+  exit(code);
+}
+
+int get_executable_path(pid_t pid, char executable_path[PATH_MAX]) {
   static char symlink_path[PATH_MAX];
   snprintf(symlink_path, PATH_MAX, "/proc/%d/exe", pid);
 
@@ -60,6 +86,19 @@ int pid_to_executable_path(pid_t pid, char executable_path[PATH_MAX]) {
     executable_path[executable_path_len] = 0;
   }
   return executable_path_len;
+}
+
+uid_t uid_by_pid(pid_t pid) {
+  struct stat info = {};
+
+  static char proc_path[128] = {};
+  snprintf(proc_path, 128, "/proc/%d", pid);
+
+  if (stat(proc_path, &info) == -1) {
+    FAIL("stat");
+  }
+
+  return info.st_uid;
 }
 
 void handle_exec_event(struct proc_event *event) {
@@ -75,12 +114,107 @@ void handle_exec_event(struct proc_event *event) {
 
   static process_info_t new_process_info = {};
   new_process_info.start_time_ns = event->timestamp_ns;
-  if (pid_to_executable_path(pid, new_process_info.executable_path) == -1) {
-    fprintf(stderr, "ERROR: failed to readlink on /proc/%d/exe: %s\n", pid, strerror(errno));
+  if (get_executable_path(pid, new_process_info.executable_path) == -1) {
+    fprintf(stderr, "WARNING: failed to readlink on /proc/%d/exe: %s\n", pid, strerror(errno));
     return;
   }
 
+  new_process_info.uid = uid_by_pid(pid);
+
   hmput(pids, pid, new_process_info);
+}
+
+bool exists_in_db(char* executable_path, char* username) {
+  assert(db != NULL);
+
+  sqlite3_stmt* select_statement = NULL;
+  int rc = sqlite3_prepare(db,
+                           "select exists "
+                           "(select 1 from spycy_data "
+                           " where executable_path = ? and "
+                           "       username = ?)",
+                           -1, &select_statement, NULL);
+  if (rc != SQLITE_OK) {
+    SQLITE3_FAIL("ERROR: failed to prepare select statement: %s\n", sqlite3_errmsg(db));
+  }
+
+  if (((rc = sqlite3_bind_text(select_statement, 1, executable_path, -1, SQLITE_STATIC)) != SQLITE_OK) ||
+      ((rc = sqlite3_bind_text(select_statement, 2, username, -1, SQLITE_STATIC)) != SQLITE_OK)) {
+    SQLITE3_FAIL("ERROR: failed to bind select statement: %s\n", sqlite3_errstr(rc));
+  }
+
+  int step = sqlite3_step(select_statement);
+  bool result = false;
+  if (step == SQLITE_ROW) {
+    result = sqlite3_column_int(select_statement, 0);
+  }
+
+  sqlite3_finalize(select_statement);
+  return result;
+}
+
+void update_executable(uint64_t execution_time_ns, char* executable_path, char* username) {
+  assert(db != NULL);
+
+  sqlite3_stmt* update_statement = NULL;
+  int rc = sqlite3_prepare_v2(db,
+                              "update spycy_data "
+                              "set nanoseconds_spent = nanoseconds_spent + ? "
+                              "where executable_path = ? and username = ?;",
+                              -1, &update_statement, NULL);
+  if (rc != SQLITE_OK) {
+    SQLITE3_FAIL("ERROR: failed to prepare update statement: %s\n", sqlite3_errmsg(db));
+  }
+
+  if (((rc = sqlite3_bind_int64(update_statement, 1, execution_time_ns)) != SQLITE_OK) ||
+      ((rc = sqlite3_bind_text(update_statement, 2, executable_path, -1, SQLITE_STATIC)) != SQLITE_OK) ||
+      ((rc = sqlite3_bind_text(update_statement, 3, username, -1, SQLITE_STATIC)) != SQLITE_OK)) {
+    SQLITE3_FAIL("ERROR: failed to bind update statement: %s\n", sqlite3_errstr(rc));
+  }
+
+  while (sqlite3_step(update_statement) != SQLITE_DONE) ;
+  sqlite3_finalize(update_statement);
+}
+
+void insert_executable(uint64_t execution_time_ns, char* executable_path, char* username) {
+  assert(db != NULL);
+
+  sqlite3_stmt* insert_statement = NULL;
+
+  int rc = sqlite3_prepare_v2(db,
+                              "insert into spycy_data (executable_path, nanoseconds_spent, username) "
+                              "values (?, ?, ?)",
+                              -1, &insert_statement, NULL);
+  if (rc != SQLITE_OK) {
+    SQLITE3_FAIL("ERROR: failed to prepare insert statement: %s\n", sqlite3_errmsg(db));
+  }
+
+
+  if (((rc = sqlite3_bind_text(insert_statement, 1, executable_path, -1, SQLITE_STATIC)) != SQLITE_OK) ||
+      ((rc = sqlite3_bind_int64(insert_statement, 2, execution_time_ns)) != SQLITE_OK) ||
+      ((rc = sqlite3_bind_text(insert_statement, 3, username, -1, SQLITE_STATIC)) != SQLITE_OK)) {
+    SQLITE3_FAIL("ERROR: failed to bind insert statement: %s\n", sqlite3_errstr(rc));
+  }
+
+  while (sqlite3_step(insert_statement) != SQLITE_DONE) ;
+  sqlite3_finalize(insert_statement);
+}
+
+void save_to_db(uint64_t execution_time_ns, char* executable_path, uid_t uid) {
+  assert(db != NULL);
+
+  struct passwd* passwd = getpwuid(uid);
+  assert(passwd != NULL);
+
+  if (exists_in_db(executable_path, passwd->pw_name)) {
+    update_executable(execution_time_ns, executable_path, passwd->pw_name);
+  } else {
+    insert_executable(execution_time_ns, executable_path, passwd->pw_name);
+  }
+
+  if (should_close) {
+    destruct();
+  }
 }
 
 void handle_exit_event(struct proc_event *event) {
@@ -95,7 +229,7 @@ void handle_exit_event(struct proc_event *event) {
   }
 
   uint64_t execution_time_ns = event->timestamp_ns - item->value.start_time_ns;
-  printf("%d %s %.3fs\n", pid, item->value.executable_path, execution_time_ns / 1e9);
+  save_to_db(execution_time_ns, item->value.executable_path, item->value.uid);
   assert(hmdel(pids, pid) == 1);
 }
 
@@ -115,18 +249,6 @@ char* default_db_path() {
   return "./spycy.db";
 }
 
-int code = 0;
-
-void destruct() {
-  if (connection != -1) {
-    close(connection);
-  }
-
-  assert(sqlite3_close(db) == SQLITE_OK);
-
-  exit(code);
-}
-
 void signal_handler(int asdf) {
   (void) asdf;
   destruct();
@@ -137,11 +259,11 @@ void prepare_db() {
 
   char* error_message = NULL;
   sqlite3_exec(db,
-               "CREATE TABLE IF NOT EXISTS spycy_data ("
-               " executable_path TEXT NOT NULL UNIQUE,"
-               " nanoseconds_spent INTEGER NOT NULL,"
-               " username TEXT NOT NULL,"
-               " PRIMARY KEY(executable_path)"
+               "create table if not exists spycy_data ("
+               " executable_path text not null unique,"
+               " nanoseconds_spent integer not null,"
+               " username text not null,"
+               " primary key(executable_path)"
                ");",
                NULL, NULL, &error_message);
 
@@ -165,9 +287,7 @@ int main(int argc, char** argv) {
   }
 
   if (sqlite3_open(db_path, &db)) {
-    fprintf(stderr, "ERROR: failed to open database: %s\n", sqlite3_errmsg(db));
-    code = 1;
-    destruct();
+    SQLITE3_FAIL("ERROR: failed to open database: %s\n", sqlite3_errmsg(db));
   }
 
   prepare_db();
@@ -221,6 +341,10 @@ int main(int argc, char** argv) {
   }
 
   while (!quit) {
+    if (should_close) {
+      break;
+    }
+
     struct cn_msg* message = (struct cn_msg *) (buffer + sizeof(struct nlmsghdr));
     struct proc_event* event = (struct proc_event *) (buffer + sizeof(struct nlmsghdr) + sizeof(struct cn_msg));
     struct nlmsghdr* header = (struct nlmsghdr *) buffer;
@@ -267,4 +391,6 @@ int main(int argc, char** argv) {
       header = NLMSG_NEXT(header, received_len);
     }
   }
+
+  destruct();
 }
