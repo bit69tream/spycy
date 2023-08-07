@@ -380,7 +380,7 @@ int main(int argc, char** argv) {
   }
 
   if (sqlite3_open(db_path, &db)) {
-    SQLITE3_FAIL("ERROR: failed to open database: %s\n", sqlite3_errmsg(db));
+    SQLITE3_FAIL("ERROR: failed to open database at %s: %s\n", db_path, sqlite3_errmsg(db));
   }
 
   printf("LOG: using database %s\n.", db_path);

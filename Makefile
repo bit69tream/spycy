@@ -5,5 +5,9 @@ LDFLAGS=`pkg-config --libs ${LIBS}`
 .PHONY: all
 all: spycy
 
+.PHONY: setcap
+setcap: spycy
+	setcap cap_net_admin+ep ./spycy
+
 %: source/%.c
 	${CC} -o $@ $^ ${CFLAGS} ${LDFLAGS}
