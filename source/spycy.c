@@ -55,13 +55,7 @@ typedef struct {
   process_info_t value;
 } item_t;
 
-typedef struct {
-  char* key;
-  uint64_t value;
-} counter_map_t;
-
-item_t* pids = NULL;
-counter_map_t* pid_counts = NULL;
+item_t* tgids = NULL;
 
 sqlite3* db = NULL;
 int connection = -1;
@@ -102,32 +96,21 @@ void handle_exec_event(struct proc_event *event) {
   (void) event;
   assert(event->what == PROC_EVENT_EXEC);
 
-  pid_t pid = event->event_data.exec.process_pid;
+  pid_t tgid = event->event_data.exec.process_tgid;
 
-  pid_t index = -1;
-  if ((index = hmgeti(pids, pid)) >= 0) {
-    hmdel(pids, pid);
+  if (hmgeti(tgids, tgid) >= 0) {
+    return;
   }
 
   static process_info_t new_process_info = {};
   new_process_info.start_time_ns = event->timestamp_ns;
-  if (get_executable_path(pid, new_process_info.executable_path) == -1) {
-    fprintf(stderr, "WARNING: failed to readlink on /proc/%d/exe: %s\n", pid, strerror(errno));
+  if (get_executable_path(tgid, new_process_info.executable_path) == -1) {
+    fprintf(stderr, "WARNING: failed to readlink on /proc/%d/exe: %s\n", tgid, strerror(errno));
     return;
   }
-  new_process_info.uid = uid_by_pid(pid);
+  new_process_info.uid = uid_by_pid(tgid);
 
-  hmput(pids, pid, new_process_info);
-
-  item_t* new_item = hmgetp_null(pids, pid);
-  assert(new_item != NULL);
-
-  counter_map_t* counter = shgetp_null(pid_counts, new_item->value.executable_path);
-  if (counter != NULL) {
-    counter->value++;
-  } else {
-    shput(pid_counts, new_item->value.executable_path, 1);
-  }
+  hmput(tgids, tgid, new_process_info);
 }
 
 bool exists_in_db(char* executable_path, char* username) {
@@ -238,13 +221,12 @@ void destruct() {
     close(connection);
   }
 
-  for (size_t i = 0; i < hmlenu(pids); i++) {
-    uint64_t execution_time_ns = last_timestamp_ns - pids[i].value.start_time_ns;
-    save_to_db(execution_time_ns, pids[i].value.executable_path, pids[i].value.uid);
+  for (size_t i = 0; i < hmlenu(tgids); i++) {
+    uint64_t execution_time_ns = last_timestamp_ns - tgids[i].value.start_time_ns;
+    save_to_db(execution_time_ns, tgids[i].value.executable_path, tgids[i].value.uid);
   }
 
-  hmfree(pids);
-  shfree(pid_counts);
+  hmfree(tgids);
 
   if (sqlite3_close(db) != SQLITE_OK) {
     should_close = true;
@@ -258,28 +240,19 @@ void handle_exit_event(struct proc_event *event) {
   (void) event;
   assert(event->what == PROC_EVENT_EXIT);
 
+  pid_t tgid = event->event_data.exec.process_tgid;
   pid_t pid = event->event_data.exec.process_pid;
 
-  item_t* item = hmgetp_null(pids, pid);
+  item_t* item = hmgetp_null(tgids, tgid);
   if (item == NULL) {
     return;
   }
 
-  counter_map_t* counter = shgetp_null(pid_counts, item->value.executable_path);
-  if (counter == NULL) {
-    goto exit;
-  }
-
-  counter->value--;
-  if (counter->value <= 0) {
-    shdel(pid_counts, item->value.executable_path);
-
+  if (pid == tgid) {
     uint64_t execution_time_ns = event->timestamp_ns - item->value.start_time_ns;
     save_to_db(execution_time_ns, item->value.executable_path, item->value.uid);
+    assert(hmdel(tgids, tgid) == 1);
   }
-
- exit:
-  assert(hmdel(pids, pid) == 1);
 }
 
 void handle_message(struct cn_msg *message) {
