@@ -244,9 +244,51 @@ void handle_message(struct cn_msg *message) {
   }
 }
 
+char* default_data_home() {
+  struct passwd *passwd = getpwuid(getuid());
+  if (passwd == NULL) {
+    FAIL("getpwuid");
+  }
+
+  static char data_home_path[PATH_MAX] = {};
+  snprintf(data_home_path, PATH_MAX, "%s/.local/share/", passwd->pw_dir);
+  return data_home_path;
+}
+
+void recursive_mkdir(char* path) {
+  char* separator = strrchr(path, '/');
+
+  if (separator == path) {
+    separator = strrchr(path + 1, '/');
+  }
+
+  if (separator != NULL) {
+    *separator = 0;
+    recursive_mkdir(path);
+    *separator = '/';
+  }
+
+  if (mkdir(path, 0777) && errno != EEXIST) {
+    FAIL("mkdir");
+  }
+}
+
 char* default_db_path() {
-  /* TODO: put it somewhere like ~/.local/share/spycy/spycy.db or ${XDG_DATA_HOME}/spycy/spycy.db */
-  return "./spycy.db";
+  char* xdg_data_home = getenv("XDG_DATA_HOME");
+  if (xdg_data_home == NULL) {
+    xdg_data_home = default_data_home();
+  }
+
+  assert(xdg_data_home != NULL);
+
+  static char db_path[PATH_MAX] = {};
+  snprintf(db_path, PATH_MAX, "%s/spycy/", xdg_data_home);
+
+  recursive_mkdir(db_path);
+
+  snprintf(db_path, PATH_MAX, "%s/spycy/spycy.db", xdg_data_home);
+
+  return db_path;
 }
 
 void signal_handler(int asdf) {
@@ -270,7 +312,7 @@ void prepare_db() {
   if (error_message != NULL) {
     fprintf(stderr, "ERROR: failed to prepare database: %s\n", error_message);
     sqlite3_free(error_message);
-
+    code = 1;
     destruct();
   }
 }
@@ -289,6 +331,8 @@ int main(int argc, char** argv) {
   if (sqlite3_open(db_path, &db)) {
     SQLITE3_FAIL("ERROR: failed to open database: %s\n", sqlite3_errmsg(db));
   }
+
+  printf("LOG: using database %s\n.", db_path);
 
   prepare_db();
 
