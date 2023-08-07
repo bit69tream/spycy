@@ -266,14 +266,19 @@ void handle_exit_event(struct proc_event *event) {
   }
 
   counter_map_t* counter = shgetp_null(pid_counts, item->value.executable_path);
-  assert(counter != NULL);
+  if (counter == NULL) {
+    goto exit;
+  }
 
   counter->value--;
-  if (counter->value == 0) {
+  if (counter->value <= 0) {
+    shdel(pid_counts, item->value.executable_path);
+
     uint64_t execution_time_ns = event->timestamp_ns - item->value.start_time_ns;
     save_to_db(execution_time_ns, item->value.executable_path, item->value.uid);
   }
 
+ exit:
   assert(hmdel(pids, pid) == 1);
 }
 
@@ -459,7 +464,7 @@ int main(int argc, char** argv) {
 
     static uint32_t seqs[4096] = {};
     if (seqs[event->cpu] && message->seq != seqs[event->cpu] + 1) {
-      fprintf(stderr, "ERROR: out of order message on cpu %d\n", event->cpu);
+      fprintf(stderr, "WARNING: out of order message on cpu %d\n", event->cpu);
     }
     seqs[event->cpu] = message->seq;
 
