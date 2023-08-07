@@ -64,18 +64,7 @@ int code = 0;
 
 bool should_close = false;
 
-void destruct() {
-  if (sqlite3_close(db) != SQLITE_OK) {
-    should_close = true;
-    return;
-  }
-
-  if (connection != -1) {
-    close(connection);
-  }
-
-  exit(code);
-}
+void destruct();
 
 int get_executable_path(pid_t pid, char executable_path[PATH_MAX]) {
   static char symlink_path[PATH_MAX];
@@ -215,6 +204,35 @@ void save_to_db(uint64_t execution_time_ns, char* executable_path, uid_t uid) {
   if (should_close) {
     destruct();
   }
+}
+
+void destruct() {
+  if (sqlite3_is_interrupted(db)) {
+    should_close = true;
+    return;
+  }
+
+  if (should_close) {
+    struct timespec now = {};
+    clock_gettime(CLOCK_BOOTTIME, &now);
+    for (size_t i = 0; i < hmlenu(pids); i++) {
+      uint64_t execution_time_ns = now.tv_nsec - pids[i].value.start_time_ns;
+      save_to_db(execution_time_ns, pids[i].value.executable_path, pids[i].value.uid);
+    }
+
+    hmfree(pids);
+  }
+
+  if (sqlite3_close(db) != SQLITE_OK) {
+    should_close = true;
+    return;
+  }
+
+  if (connection != -1) {
+    close(connection);
+  }
+
+  exit(code);
 }
 
 void handle_exit_event(struct proc_event *event) {
